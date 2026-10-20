@@ -1,0 +1,81 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build
+        run: dotnet build workspaces.sln --configuration Release
+      - name: Publish
+        run: ./src/publish.ps1
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspaces-win-x64
+          path: src/artifacts/workspaces.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.sha }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: workspaces-win-x64
+          path: artifacts
+      - name: Create or update commit release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $executable = Join-Path $PWD 'artifacts/workspaces.exe'
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+              throw 'Published workspaces.exe is missing.'
+          }
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sha -ne $env:GITHUB_SHA) {
+              throw 'Checkout does not match the built commit.'
+          }
+          $title = $sha.Substring(0, 7)
+          $tag = "commit-$sha"
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          # Git writes UTF-8 bytes directly; avoid interpolating commit text into shell code.
+          git -c i18n.logOutputEncoding=utf-8 --no-pager log -1 --format=%B --output=$notes $sha
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the commit message.' }
+
+          gh release view $tag --json id *> $null
+          if ($LASTEXITCODE -eq 0) {
+              gh release edit $tag --title $title --notes-file $notes
+              if ($LASTEXITCODE -ne 0) { throw 'Could not update the release.' }
+          } else {
+              gh release create $tag --target $sha --title $title --notes-file $notes
+              if ($LASTEXITCODE -ne 0) { throw 'Could not create the release.' }
+          }
+          gh release upload $tag $executable --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not upload workspaces.exe.' }
